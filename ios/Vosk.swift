@@ -124,7 +124,7 @@ class Vosk: RCTEventEmitter {
 
         do {
             // Ask the user for permission to use the mic if required then start the engine.
-            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
+            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
             try audioSession.setActive(true)
 
             formatInput = inputNode.inputFormat(forBus: 0)
