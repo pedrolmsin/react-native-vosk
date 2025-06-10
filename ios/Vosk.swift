@@ -124,7 +124,7 @@ class Vosk: RCTEventEmitter {
 
         do {
             // Ask the user for permission to use the mic if required then start the engine.
-            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
             try audioSession.setActive(true)
 
             formatInput = inputNode.inputFormat(forBus: 0)
@@ -237,12 +237,12 @@ class Vosk: RCTEventEmitter {
 
         // Restore AVAudioSession to default mode
         let audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession.setCategory(.playback, mode: .default, options: [])
-            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-        } catch {
+         do {
+           // try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+             try audioSession.setActive(false)
+         } catch {
             print("Error restoring AVAudioSession: \(error)")
-        }
+         }
     }
 
     /// Process the audio buffer and do recognition with Vosk
