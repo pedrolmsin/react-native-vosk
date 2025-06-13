@@ -2,19 +2,13 @@ import Foundation
 import AVFoundation
 import React
 
-// The representation of the JSON object returned by Vosk
 struct VoskResult: Codable {
-    // Partial result
     var partial: String?
-    // Complete result
     var text: String?
 }
 
-// Structure of options for start method
 struct VoskStartOptions {
-    // Grammar to use
     var grammar: [String]?
-    // Timeout in milliseconds
     var timeout: Int?
 }
 extension VoskStartOptions: Codable {
@@ -28,102 +22,77 @@ extension VoskStartOptions: Codable {
 
 @objc(Vosk)
 class Vosk: RCTEventEmitter {
-    // Class properties
-    /// The current vosk model loaded
     var currentModel: VoskModel?
-    /// The vosk recognizer
-    var recognizer : OpaquePointer?
-    /// The audioEngine used to pipe microphone to recognizer
+    var recognizer: OpaquePointer?
     let audioEngine = AVAudioEngine()
-    /// The audioEngine input
     var inputNode: AVAudioInputNode!
-    /// The microphone input format
     var formatInput: AVAudioFormat!
-    /// A queue to process datas
     var processingQueue: DispatchQueue!
-    /// Keep the last processed result here
     var lastRecognizedResult: VoskResult?
-    /// The timeout timer ref
     var timeoutTimer: Timer?
-    /// The current grammar set
     var grammar: [String]?
-
-    /// React member: has any JS event listener
     var hasListener: Bool = false
 
-    // Class methods
     override init() {
         super.init()
-        // Init the processing queue
         processingQueue = DispatchQueue(label: "recognizerQueue")
-        // Create a new audio engine.
         inputNode = audioEngine.inputNode
-        // Get the microphone default input format
         formatInput = inputNode.inputFormat(forBus: 0)
     }
 
     deinit {
-        // free the recognizer
-        vosk_recognizer_free(recognizer);
+        if recognizer != nil {
+            vosk_recognizer_free(recognizer)
+        }
     }
 
-    /// Called when React adds an event observer
     override func startObserving() {
         hasListener = true
     }
 
-    /// Called when no more event observers are running
     override func stopObserving() {
         hasListener = false
     }
 
-    /// React method to define allowed events
     @objc override func supportedEvents() -> [String]! {
         return ["onError", "onResult", "onFinalResult", "onPartialResult", "onTimeout"]
     }
 
-    /// Load a Vosk model
     @objc(loadModel:withResolver:withRejecter:)
     func loadModel(name: String, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) -> Void {
         if currentModel != nil {
-            currentModel = nil // deinit model
+            currentModel = nil
         }
 
-        // Load the model in a try catch block
         do {
             try currentModel = VoskModel(name: name)
             resolve(true)
         } catch {
-            reject(nil, nil, nil)
+            reject("load_model", "Failed to load model", error)
         }
     }
 
-    /// Start speech recognition
     @objc(start:withResolver:withRejecter:)
     func start(rawOptions: [String: Any]?, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) -> Void {
-        let audioSession = AVAudioSession.sharedInstance()
+        guard let model = currentModel else {
+            reject("start", "No model loaded", nil)
+            return
+        }
 
+        let audioSession = AVAudioSession.sharedInstance()
         var options: VoskStartOptions? = nil
         do {
-            options = (rawOptions != nil) ? try VoskStartOptions(dictionary: rawOptions!) : nil
+            if let rawOptions = rawOptions {
+                options = try VoskStartOptions(dictionary: rawOptions)
+            }
         } catch {
-            print(error)
+            print("Failed to parse options: \(error)")
         }
 
-        // if grammar is set in options, override the current grammar
-        var grammar: [String]?
-        if let grammarOptions = options?.grammar, !grammarOptions.isEmpty {
-            grammar = grammarOptions
-        }
-
-        // if timeout is set in options, handle it
-        var timeout: Int?
-        if let timeoutOptions = options?.timeout {
-            timeout = timeoutOptions
-        }
+        let grammar = options?.grammar
+        let timeout = options?.timeout
 
         do {
-            // Ask the user for permission to use the mic if required then start the engine.
             try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
             try audioSession.setActive(true)
 
@@ -131,44 +100,44 @@ class Vosk: RCTEventEmitter {
             let sampleRate = formatInput.sampleRate.isFinite && formatInput.sampleRate > 0 ? formatInput.sampleRate : 16000
             let channelCount = formatInput.channelCount > 0 ? formatInput.channelCount : 1
 
-            let formatPcm = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                          sampleRate: sampleRate,
-                                          channels: UInt32(channelCount),
-                                          interleaved: true)
-
-            guard let formatPcm = formatPcm else {
+            guard let formatPcm = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                                sampleRate: sampleRate,
+                                                channels: UInt32(channelCount),
+                                                interleaved: true) else {
                 reject("start", "Unable to create audio format", nil)
                 return
             }
 
             if let grammar = grammar, !grammar.isEmpty {
-                let jsonGrammar = try! JSONEncoder().encode(grammar)
-                recognizer = vosk_recognizer_new_grm(currentModel!.model, Float(sampleRate), String(data: jsonGrammar, encoding: .utf8))
+                let jsonGrammar = try JSONEncoder().encode(grammar)
+                recognizer = vosk_recognizer_new_grm(model.model, Float(sampleRate), String(data: jsonGrammar, encoding: .utf8))
             } else {
-                recognizer = vosk_recognizer_new(currentModel!.model, Float(sampleRate))
+                recognizer = vosk_recognizer_new(model.model, Float(sampleRate))
             }
 
-            inputNode.installTap(onBus: 0,
-                                 bufferSize: UInt32(sampleRate / 10),
-                                 format: formatPcm) { buffer, time in
+            inputNode.installTap(onBus: 0, bufferSize: UInt32(sampleRate / 10), format: formatPcm) { buffer, _ in
                 self.processingQueue.async {
                     let res = self.recognizeData(buffer: buffer)
                     DispatchQueue.main.async {
-                        let parsedResult = try! JSONDecoder().decode(VoskResult.self, from: res.result!.data(using: .utf8)!)
-                        if res.completed && self.hasListener && res.result != nil {
-                            self.sendEvent(withName: "onResult", body: parsedResult.text!)
-                        } else if !res.completed && self.hasListener && res.result != nil {
-                            // check if partial result is different from last one
-                            if self.lastRecognizedResult == nil || self.lastRecognizedResult!.partial != parsedResult.partial && !parsedResult.partial!.isEmpty {
-                                self.sendEvent(withName: "onPartialResult", body: parsedResult.partial)
+                        guard let result = res.result else { return }
+
+                        do {
+                            let parsedResult = try JSONDecoder().decode(VoskResult.self, from: result.data(using: .utf8)!)
+                            if res.completed && self.hasListener, let text = parsedResult.text, !text.isEmpty {
+                                self.sendEvent(withName: "onResult", body: text)
+                            } else if !res.completed && self.hasListener, let partial = parsedResult.partial, !partial.isEmpty {
+                                if self.lastRecognizedResult?.partial != partial {
+                                    self.sendEvent(withName: "onPartialResult", body: partial)
+                                }
                             }
+                            self.lastRecognizedResult = parsedResult
+                        } catch {
+                            print("Failed to decode result: \(error)")
                         }
-                        self.lastRecognizedResult = parsedResult
                     }
                 }
             }
 
-            // Start the stream of audio data.
             audioEngine.prepare()
 
             audioSession.requestRecordPermission { [weak self] success in
@@ -176,13 +145,10 @@ class Vosk: RCTEventEmitter {
                 try? self.audioEngine.start()
             }
 
-            // and manage timeout if set in options
             if let timeout = timeout {
-                // Run timer on main thread
                 DispatchQueue.main.async {
                     self.timeoutTimer = Timer.scheduledTimer(withTimeInterval: Double(timeout) / 1000, repeats: false) { _ in
                         self.processingQueue.async {
-                            // and exit on the process queue
                             self.stopInternal(withoutEvents: true)
                             self.sendEvent(withName: "onTimeout", body: "")
                         }
@@ -193,68 +159,78 @@ class Vosk: RCTEventEmitter {
             resolve("Recognizer successfully started")
         } catch {
             if hasListener {
-                sendEvent(withName: "onError", body: "Unable to start AVAudioEngine " + error.localizedDescription)
-            } else {
-                debugPrint("Unable to start AVAudioEngine " + error.localizedDescription)
+                sendEvent(withName: "onError", body: "Unable to start AVAudioEngine: \(error.localizedDescription)")
             }
-            vosk_recognizer_free(recognizer)
+            if recognizer != nil {
+                vosk_recognizer_free(recognizer)
+                recognizer = nil
+            }
             reject("start", error.localizedDescription, error)
         }
     }
 
-    /// Unload speech recognition and model
-    @objc(unload) func unload() -> Void {
+    @objc(unload)
+    func unload() {
         stopInternal(withoutEvents: false)
-        if currentModel != nil {
-            currentModel = nil // deinit model
-        }
+        currentModel = nil
     }
 
-    /// Stop speech recognition if started
-    @objc(stop) func stop() -> Void {
-        // stop engines and send onFinalResult event
+    @objc(stop)
+    func stop() {
         stopInternal(withoutEvents: false)
     }
 
-    /// Do internal cleanup on stop recognition
     func stopInternal(withoutEvents: Bool) {
         inputNode.removeTap(onBus: 0)
+
         if audioEngine.isRunning {
             audioEngine.stop()
             if hasListener && !withoutEvents {
-                sendEvent(withName: "onFinalResult", body: lastRecognizedResult?.partial)
+                if let partial = lastRecognizedResult?.partial, !partial.isEmpty {
+                    sendEvent(withName: "onFinalResult", body: partial)
+                }
             }
-            lastRecognizedResult = nil
         }
+
+        lastRecognizedResult = nil
+
         if recognizer != nil {
             vosk_recognizer_free(recognizer)
             recognizer = nil
         }
-        if timeoutTimer != nil {
-            timeoutTimer?.invalidate()
-            timeoutTimer = nil
-        }
 
-        // Restore AVAudioSession to default mode
+        timeoutTimer?.invalidate()
+        timeoutTimer = nil
+
         let audioSession = AVAudioSession.sharedInstance()
-         do {
-           // try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
-             try audioSession.setActive(false)
-         } catch {
+        do {
+            try audioSession.setActive(false)
+        } catch {
             print("Error restoring AVAudioSession: \(error)")
-         }
+        }
     }
 
-    /// Process the audio buffer and do recognition with Vosk
     func recognizeData(buffer: AVAudioPCMBuffer) -> (result: String?, completed: Bool) {
-        let dataLen = Int(buffer.frameLength * 2)
-        let channels = UnsafeBufferPointer(start: buffer.int16ChannelData, count: 1)
-        let endOfSpeech = channels[0].withMemoryRebound(to: Int8.self, capacity: dataLen) {
-            return vosk_recognizer_accept_waveform(recognizer, $0, Int32(dataLen))
+        guard let channelData = buffer.int16ChannelData else {
+            print("int16ChannelData is nil")
+            return (nil, false)
         }
-        let res = endOfSpeech == 1 ?
-        vosk_recognizer_result(recognizer) :
-        vosk_recognizer_partial_result(recognizer)
-        return (String(validatingUTF8: res!), endOfSpeech == 1)
+
+        let dataLen = Int(buffer.frameLength * 2)
+        let channels = UnsafeBufferPointer(start: channelData, count: 1)
+
+        let endOfSpeech = channels[0].withMemoryRebound(to: Int8.self, capacity: dataLen) {
+            vosk_recognizer_accept_waveform(recognizer, $0, Int32(dataLen))
+        }
+
+        guard let cStringResult = endOfSpeech == 1
+                ? vosk_recognizer_result(recognizer)
+                : vosk_recognizer_partial_result(recognizer),
+              let stringResult = String(validatingUTF8: cStringResult) else {
+            print("Failed to convert result to String")
+            return (nil, false)
+        }
+
+        return (stringResult, endOfSpeech == 1)
     }
 }
