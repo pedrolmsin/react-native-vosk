@@ -32,6 +32,7 @@ class Vosk: RCTEventEmitter {
     var timeoutTimer: Timer?
     var grammar: [String]?
     var hasListener: Bool = false
+    var isCleaningUp: Bool = false
 
     override init() {
         super.init()
@@ -116,6 +117,11 @@ class Vosk: RCTEventEmitter {
             }
 
             inputNode.installTap(onBus: 0, bufferSize: UInt32(sampleRate / 10), format: formatPcm) { buffer, _ in
+                guard !self.isCleaningUp else {
+                    print("Tap received audio while cleaning up.")
+                    return
+                }
+
                 self.processingQueue.async {
                     let res = self.recognizeData(buffer: buffer)
                     DispatchQueue.main.async {
@@ -171,13 +177,17 @@ class Vosk: RCTEventEmitter {
 
     @objc(unload)
     func unload() {
+        isCleaningUp = true
         stopInternal(withoutEvents: false)
+        isCleaningUp = false
         currentModel = nil
     }
 
     @objc(stop)
     func stop() {
+        isCleaningUp = true
         stopInternal(withoutEvents: false)
+        isCleaningUp = false
     }
 
     func stopInternal(withoutEvents: Bool) {
@@ -194,13 +204,16 @@ class Vosk: RCTEventEmitter {
 
         lastRecognizedResult = nil
 
-        if recognizer != nil {
-            vosk_recognizer_free(recognizer)
-            recognizer = nil
-        }
-
         timeoutTimer?.invalidate()
         timeoutTimer = nil
+
+        // Delay to ensure that the tap has been removed before releasing the recognizer
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if self.recognizer != nil {
+                vosk_recognizer_free(self.recognizer)
+                self.recognizer = nil
+            }
+        }
 
         let audioSession = AVAudioSession.sharedInstance()
         do {
@@ -211,6 +224,16 @@ class Vosk: RCTEventEmitter {
     }
 
     func recognizeData(buffer: AVAudioPCMBuffer) -> (result: String?, completed: Bool) {
+        if isCleaningUp {
+            print("Skipping recognition because isCleaningUp is true.")
+            return (nil, false)
+        }
+
+        guard let recognizer = self.recognizer else {
+            print("Recognizer is nil")
+            return (nil, false)
+        }
+
         guard let channelData = buffer.int16ChannelData else {
             print("int16ChannelData is nil")
             return (nil, false)
